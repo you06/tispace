@@ -54,7 +54,10 @@ func NewCore(schema string, dropValue bool) (*Core, error) {
 	if err != nil {
 		return nil, err
 	}
-	ctx.GetSessionVars().IDAllocator = autoid.NewAllocatorFromTempTblInfo(tbl)
+	sessVars := ctx.GetSessionVars()
+	sessVars.IDAllocator = autoid.NewAllocatorFromTempTblInfo(tbl)
+	sessVars.MemTracker.SetBytesLimit(64 << 30)
+	kv.TxnTotalSizeLimit.Store(uint64(64 << 30))
 	core := &Core{
 		ctx:       ctx,
 		model:     createTableNode,
