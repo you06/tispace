@@ -10,10 +10,11 @@ import (
 )
 
 var (
-	schema string
-	rows   uint64
-	sample uint64
-	mode   string
+	schema    string
+	rows      uint64
+	sample    uint64
+	mode      string
+	dropValue bool
 )
 
 func init() {
@@ -21,6 +22,7 @@ func init() {
 	flag.Uint64Var(&rows, "rows", 1_000_000, "number of rows")
 	flag.Uint64Var(&sample, "sample", 10_000, "sample every n rows")
 	flag.StringVar(&mode, "mode", "insert", "mode: insert, delete, update")
+	flag.BoolVar(&dropValue, "drop-value", false, "drop value to save memory")
 	flag.Parse()
 	logutil.SetLevel("error")
 }
@@ -40,7 +42,7 @@ func main() {
 		return
 	}
 	schemaSQL := string(b)
-	core, err := NewCore(schemaSQL)
+	core, err := NewCore(schemaSQL, dropValue)
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -53,6 +55,20 @@ func main() {
 			return
 		}
 		fmt.Printf("insert %d rows with memory cost: %s(%d bytes)\n", rows, readableSize(n), n)
+	case "update":
+		n, err := core.UpdateRows(int(rows), int(sample))
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		fmt.Printf("update %d rows with memory cost: %s(%d bytes)\n", rows, readableSize(n), n)
+	case "delete":
+		n, err := core.DeleteRows(int(rows), int(sample))
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		fmt.Printf("delete %d rows with memory cost: %s(%d bytes)\n", rows, readableSize(n), n)
 	default:
 		info := fmt.Sprintf("mode %s is not supported", mode)
 		fmt.Println(info)

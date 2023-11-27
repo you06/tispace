@@ -8,9 +8,13 @@ import (
 	"time"
 
 	"github.com/pingcap/tidb/pkg/ddl"
+	"github.com/pingcap/tidb/pkg/expression"
+	"github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/meta/autoid"
 	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/planner/core"
 	"github.com/pingcap/tidb/pkg/store/mockstore"
 	"github.com/pingcap/tidb/pkg/table"
 	"github.com/pingcap/tidb/pkg/table/tables"
@@ -19,13 +23,15 @@ import (
 )
 
 type Core struct {
-	ctx       *mock.Context
-	model     *ast.CreateTableStmt
-	tbl       table.Table
-	colAllocs []*Allocator
+	ctx        *mock.Context
+	model      *ast.CreateTableStmt
+	tbl        table.Table
+	colAllocs  []*Allocator
+	dropValue  bool
+	handleCols core.HandleCols
 }
 
-func NewCore(schema string) (*Core, error) {
+func NewCore(schema string, dropValue bool) (*Core, error) {
 	p := parser.New()
 	stmtNodes, _, err := p.Parse(schema, "", "")
 	if err != nil {
@@ -48,16 +54,87 @@ func NewCore(schema string) (*Core, error) {
 	if err != nil {
 		return nil, err
 	}
+	ctx.GetSessionVars().IDAllocator = autoid.NewAllocatorFromTempTblInfo(tbl)
 	core := &Core{
 		ctx:       ctx,
 		model:     createTableNode,
 		tbl:       tables.MockTableFromMeta(tbl),
 		colAllocs: make([]*Allocator, 0, len(createTableNode.Cols)),
+		dropValue: dropValue,
 	}
 	for _, col := range createTableNode.Cols {
 		core.colAllocs = append(core.colAllocs, NewAllocator(col))
 	}
+	if err = core.initHandleCols(); err != nil {
+		return nil, err
+	}
 	return core, nil
+}
+
+func (c *Core) initHandleCols() error {
+	// c.handleCols = c.tbl.WritableCols()
+	meta := c.tbl.Meta()
+	sessionVars := c.ctx.GetSessionVars()
+	buildExprCol := func(col *table.Column) *expression.Column {
+		return &expression.Column{
+			UniqueID: sessionVars.AllocPlanColumnID(),
+			ID:       col.ID,
+			RetType:  col.FieldType.Clone(),
+			OrigName: col.Name.O,
+			IsHidden: col.Hidden,
+		}
+	}
+	if meta.PKIsHandle {
+		for _, col := range c.tbl.Cols() {
+			if col.IsPKHandleColumn(meta) {
+				newCol := buildExprCol(col)
+				c.handleCols = core.NewIntHandleCols(newCol)
+				return nil
+			}
+		}
+	}
+	primaryIdx := tables.FindPrimaryIndex(meta)
+	tableCols := make([]*expression.Column, len(meta.Columns))
+	for i, col := range meta.Columns {
+		tableCols[i] = &expression.Column{
+			ID:      col.ID,
+			RetType: &col.FieldType,
+		}
+	}
+	for i, pkCol := range primaryIdx.Columns {
+		tableCols[pkCol.Offset].Index = i
+	}
+	c.handleCols = core.NewCommonHandleCols(c.ctx.GetSessionVars().StmtCtx, meta, primaryIdx, tableCols)
+
+	return nil
+}
+
+func (c *Core) mayDropValueMemDB(txn kv.Transaction) (kv.MemBuffer, error) {
+	if !c.dropValue {
+		return txn.GetMemBuffer(), nil
+	}
+	memBuffer := txn.GetMemBuffer()
+	keys := make([]kv.Key, 0, memBuffer.Len())
+	iter, err := memBuffer.Iter(nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	for iter.Valid() {
+		key := iter.Key()
+		copyKey := make([]byte, len(key))
+		copy(copyKey, key)
+		keys = append(keys, copyKey)
+		if err := iter.Next(); err != nil {
+			return nil, err
+		}
+	}
+	memBuffer = txn.GetMemBuffer()
+	start := time.Now()
+	for _, key := range keys {
+		memBuffer.Delete(key)
+	}
+	fmt.Printf("drop %d keys cost %s\n", len(keys), time.Since(start))
+	return memBuffer, nil
 }
 
 func (c *Core) InsertRows(n, sample int) (int, error) {
@@ -77,13 +154,100 @@ func (c *Core) InsertRows(n, sample int) (int, error) {
 			return 0, err
 		}
 	}
-	fmt.Printf("sample %d lines cost %s\n", sampleRows, time.Since(start))
-	membuf := txn.GetMemBuffer()
+	fmt.Printf("sample %d lines cost %s, %s per row\n", sampleRows, time.Since(start), time.Since(start)/time.Duration(sampleRows))
+	membuf, err := c.mayDropValueMemDB(txn)
+	if err != nil {
+		return 0, err
+	}
+	return (membuf.Size() / sampleRows) * n, nil
+}
+
+func (c *Core) prepareRows(count int) ([]kv.Handle, [][]types.Datum, error) {
+	if err := c.ctx.NewTxn(context.Background()); err != nil {
+		return nil, nil, err
+	}
+	handles := make([]kv.Handle, 0, count)
+	rows := make([][]types.Datum, 0, count)
+	for i := 0; i < count; i++ {
+		row := c.GetRow()
+		rows = append(rows, row)
+		handle, err := c.tbl.AddRecord(c.ctx, row)
+		if err != nil {
+			return nil, nil, err
+		}
+		handles = append(handles, handle)
+	}
+	if err := c.ctx.CommitTxn(context.Background()); err != nil {
+		return nil, nil, err
+	}
+	return handles, rows, nil
+}
+
+func (c *Core) UpdateRows(n, sample int) (int, error) {
+	sampleRows := n / sample
+	handles, befores, err := c.prepareRows(sampleRows)
+	if err != nil {
+		return 0, err
+	}
+	if err := c.ctx.NewTxn(context.Background()); err != nil {
+		return 0, err
+	}
+	txn, err := c.ctx.Txn(true)
+	if err != nil {
+		return 0, err
+	}
+	start := time.Now()
+	for i := 0; i < sampleRows; i++ {
+		after := c.GetRow()
+		before := befores[i]
+		handle := handles[i]
+		touched := make([]bool, len(c.model.Cols))
+		for j := 0; j < len(touched); j++ {
+			touched[j] = true
+		}
+		if err := c.tbl.UpdateRecord(context.Background(), c.ctx, handle, before, after, touched); err != nil {
+			return 0, err
+		}
+	}
+	fmt.Printf("sample %d lines cost %s, %s per row\n", sampleRows, time.Since(start), time.Since(start)/time.Duration(sampleRows))
+	membuf, err := c.mayDropValueMemDB(txn)
+	if err != nil {
+		return 0, err
+	}
 	return (membuf.Size() / sampleRows) * n, nil
 }
 
 func (c *Core) DeleteRows(n, sample int) (int, error) {
-	return 0, nil
+	sampleRows := n / sample
+	handles, befores, err := c.prepareRows(sampleRows)
+	if err != nil {
+		return 0, err
+	}
+	if err := c.ctx.NewTxn(context.Background()); err != nil {
+		return 0, err
+	}
+	txn, err := c.ctx.Txn(true)
+	if err != nil {
+		return 0, err
+	}
+	start := time.Now()
+	for i := 0; i < sampleRows; i++ {
+		before := befores[i]
+		handle := handles[i]
+		touched := make([]bool, len(c.model.Cols))
+		for j := 0; j < len(touched); j++ {
+			touched[j] = true
+		}
+		if err := c.tbl.RemoveRecord(c.ctx, handle, before); err != nil {
+			return 0, err
+		}
+	}
+	fmt.Printf("sample %d lines cost %s, %s per row\n", sampleRows, time.Since(start), time.Since(start)/time.Duration(sampleRows))
+	membuf, err := c.mayDropValueMemDB(txn)
+	if err != nil {
+		return 0, err
+	}
+	return (membuf.Size() / sampleRows) * n, nil
 }
 
 func (c *Core) GetRow() []types.Datum {
