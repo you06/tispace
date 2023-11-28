@@ -68,9 +68,9 @@ func NewCore(schema string, dropValue bool) (*Core, error) {
 	for _, col := range createTableNode.Cols {
 		core.colAllocs = append(core.colAllocs, NewAllocator(col))
 	}
-	if err = core.initHandleCols(); err != nil {
-		return nil, err
-	}
+	// if err = core.initHandleCols(); err != nil {
+	// 	return nil, err
+	// }
 	return core, nil
 }
 
