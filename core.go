@@ -27,11 +27,12 @@ type Core struct {
 	model      *ast.CreateTableStmt
 	tbl        table.Table
 	colAllocs  []*Allocator
+	dropKey    bool
 	dropValue  bool
 	handleCols core.HandleCols
 }
 
-func NewCore(schema string, dropValue bool) (*Core, error) {
+func NewCore(schema string, dropKey, dropValue bool) (*Core, error) {
 	p := parser.New()
 	stmtNodes, _, err := p.Parse(schema, "", "")
 	if err != nil {
@@ -63,6 +64,7 @@ func NewCore(schema string, dropValue bool) (*Core, error) {
 		model:     createTableNode,
 		tbl:       tables.MockTableFromMeta(tbl),
 		colAllocs: make([]*Allocator, 0, len(createTableNode.Cols)),
+		dropKey:   dropKey,
 		dropValue: dropValue,
 	}
 	for _, col := range createTableNode.Cols {
@@ -75,7 +77,6 @@ func NewCore(schema string, dropValue bool) (*Core, error) {
 }
 
 func (c *Core) initHandleCols() error {
-	// c.handleCols = c.tbl.WritableCols()
 	meta := c.tbl.Meta()
 	sessionVars := c.ctx.GetSessionVars()
 	buildExprCol := func(col *table.Column) *expression.Column {
@@ -113,7 +114,8 @@ func (c *Core) initHandleCols() error {
 }
 
 func (c *Core) mayDropValueMemDB(txn kv.Transaction) (kv.MemBuffer, error) {
-	if !c.dropValue {
+	if !c.dropValue || c.dropKey {
+		// no need to drop value when keys are already dropped.
 		return txn.GetMemBuffer(), nil
 	}
 	memBuffer := txn.GetMemBuffer()
@@ -140,8 +142,16 @@ func (c *Core) mayDropValueMemDB(txn kv.Transaction) (kv.MemBuffer, error) {
 	return memBuffer, nil
 }
 
+func (c *Core) Context() context.Context {
+	ctx := context.Background()
+	if !c.dropKey {
+		return ctx
+	}
+	return context.WithValue(ctx, "dropKVMemBuffer", true)
+}
+
 func (c *Core) InsertRows(n, sample int) (int, error) {
-	if err := c.ctx.NewTxn(context.Background()); err != nil {
+	if err := c.ctx.NewTxn(c.Context()); err != nil {
 		return 0, err
 	}
 	txn, err := c.ctx.Txn(true)
@@ -192,7 +202,7 @@ func (c *Core) UpdateRows(n, sample int) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := c.ctx.NewTxn(context.Background()); err != nil {
+	if err := c.ctx.NewTxn(c.Context()); err != nil {
 		return 0, err
 	}
 	txn, err := c.ctx.Txn(true)
@@ -226,7 +236,7 @@ func (c *Core) DeleteRows(n, sample int) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := c.ctx.NewTxn(context.Background()); err != nil {
+	if err := c.ctx.NewTxn(c.Context()); err != nil {
 		return 0, err
 	}
 	txn, err := c.ctx.Txn(true)

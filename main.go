@@ -14,6 +14,7 @@ var (
 	rows      uint64
 	sample    uint64
 	mode      string
+	dropKey   bool
 	dropValue bool
 )
 
@@ -22,6 +23,7 @@ func init() {
 	flag.Uint64Var(&rows, "rows", 1_000_000, "number of rows")
 	flag.Uint64Var(&sample, "sample", 10_000, "sample every n rows")
 	flag.StringVar(&mode, "mode", "insert", "mode: insert, delete, update")
+	flag.BoolVar(&dropKey, "drop-key", false, "drop key to save memory")
 	flag.BoolVar(&dropValue, "drop-value", false, "drop value to save memory")
 	flag.Parse()
 	logutil.SetLevel("error")
@@ -42,7 +44,7 @@ func main() {
 		return
 	}
 	schemaSQL := string(b)
-	core, err := NewCore(schemaSQL, dropValue)
+	core, err := NewCore(schemaSQL, dropKey, dropValue)
 	if err != nil {
 		fmt.Println(err)
 		return
