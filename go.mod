@@ -1,4 +1,4 @@
-module tispace
+module github.com/you06/tispace
 
 go 1.21
 

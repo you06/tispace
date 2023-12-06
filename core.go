@@ -92,7 +92,6 @@ func (c *Core) InsertRows(n, sample int) (int, error) {
 		return 0, err
 	}
 	sampleRows := n / sample
-	runtime.GC()
 	stage := NewMemStage()
 	start := time.Now()
 	for i := 0; i < sampleRows; i++ {
@@ -147,7 +146,6 @@ func (c *Core) UpdateRows(n, sample int) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	runtime.GC()
 	stage := NewMemStage()
 	start := time.Now()
 	for i := 0; i < sampleRows; i++ {
@@ -188,7 +186,6 @@ func (c *Core) DeleteRows(n, sample int) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	runtime.GC()
 	stage := NewMemStage()
 	start := time.Now()
 	for i := 0; i < sampleRows; i++ {
