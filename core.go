@@ -5,10 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"runtime"
 	"time"
 
 	"github.com/pingcap/tidb/pkg/ddl"
-	"github.com/pingcap/tidb/pkg/expression"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/meta/autoid"
 	"github.com/pingcap/tidb/pkg/parser"
@@ -70,84 +70,17 @@ func NewCore(schema string, dropKey, dropValue bool) (*Core, error) {
 	for _, col := range createTableNode.Cols {
 		core.colAllocs = append(core.colAllocs, NewAllocator(col))
 	}
-	// if err = core.initHandleCols(); err != nil {
-	// 	return nil, err
-	// }
 	return core, nil
-}
-
-func (c *Core) initHandleCols() error {
-	meta := c.tbl.Meta()
-	sessionVars := c.ctx.GetSessionVars()
-	buildExprCol := func(col *table.Column) *expression.Column {
-		return &expression.Column{
-			UniqueID: sessionVars.AllocPlanColumnID(),
-			ID:       col.ID,
-			RetType:  col.FieldType.Clone(),
-			OrigName: col.Name.O,
-			IsHidden: col.Hidden,
-		}
-	}
-	if meta.PKIsHandle {
-		for _, col := range c.tbl.Cols() {
-			if col.IsPKHandleColumn(meta) {
-				newCol := buildExprCol(col)
-				c.handleCols = core.NewIntHandleCols(newCol)
-				return nil
-			}
-		}
-	}
-	primaryIdx := tables.FindPrimaryIndex(meta)
-	tableCols := make([]*expression.Column, len(meta.Columns))
-	for i, col := range meta.Columns {
-		tableCols[i] = &expression.Column{
-			ID:      col.ID,
-			RetType: &col.FieldType,
-		}
-	}
-	for i, pkCol := range primaryIdx.Columns {
-		tableCols[pkCol.Offset].Index = i
-	}
-	c.handleCols = core.NewCommonHandleCols(c.ctx.GetSessionVars().StmtCtx, meta, primaryIdx, tableCols)
-
-	return nil
-}
-
-func (c *Core) mayDropValueMemDB(txn kv.Transaction) (kv.MemBuffer, error) {
-	if !c.dropValue || c.dropKey {
-		// no need to drop value when keys are already dropped.
-		return txn.GetMemBuffer(), nil
-	}
-	memBuffer := txn.GetMemBuffer()
-	keys := make([]kv.Key, 0, memBuffer.Len())
-	iter, err := memBuffer.Iter(nil, nil)
-	if err != nil {
-		return nil, err
-	}
-	for iter.Valid() {
-		key := iter.Key()
-		copyKey := make([]byte, len(key))
-		copy(copyKey, key)
-		keys = append(keys, copyKey)
-		if err := iter.Next(); err != nil {
-			return nil, err
-		}
-	}
-	memBuffer = txn.GetMemBuffer()
-	start := time.Now()
-	for _, key := range keys {
-		memBuffer.Delete(key)
-	}
-	fmt.Printf("drop %d keys cost %s\n", len(keys), time.Since(start))
-	return memBuffer, nil
 }
 
 func (c *Core) Context() context.Context {
 	ctx := context.Background()
-	if !c.dropKey {
-		return ctx
+	if c.dropKey {
+		ctx = context.WithValue(ctx, "dropKVMemBuffer", "key")
+	} else if c.dropValue {
+		ctx = context.WithValue(ctx, "dropKVMemBuffer", "value")
 	}
-	return context.WithValue(ctx, "dropKVMemBuffer", true)
+	return ctx
 }
 
 func (c *Core) InsertRows(n, sample int) (int, error) {
@@ -159,6 +92,8 @@ func (c *Core) InsertRows(n, sample int) (int, error) {
 		return 0, err
 	}
 	sampleRows := n / sample
+	runtime.GC()
+	stage := NewMemStage()
 	start := time.Now()
 	for i := 0; i < sampleRows; i++ {
 		row := c.GetRow()
@@ -168,10 +103,12 @@ func (c *Core) InsertRows(n, sample int) (int, error) {
 		}
 	}
 	fmt.Printf("sample %d lines cost %s, %s per row\n", sampleRows, time.Since(start), time.Since(start)/time.Duration(sampleRows))
-	membuf, err := c.mayDropValueMemDB(txn)
-	if err != nil {
-		return 0, err
-	}
+	membuf := txn.GetMemBuffer()
+	diff := stage.Diff()
+	diff.CompareWithMemBuffer("insert", membuf, n, sampleRows)
+	runtime.GC()
+	diff = stage.Diff()
+	diff.CompareWithMemBuffer("insert-gc", membuf, n, sampleRows)
 	return (membuf.Size() / sampleRows) * n, nil
 }
 
@@ -209,6 +146,8 @@ func (c *Core) UpdateRows(n, sample int) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	runtime.GC()
+	stage := NewMemStage()
 	start := time.Now()
 	for i := 0; i < sampleRows; i++ {
 		after := c.GetRow()
@@ -223,10 +162,9 @@ func (c *Core) UpdateRows(n, sample int) (int, error) {
 		}
 	}
 	fmt.Printf("sample %d lines cost %s, %s per row\n", sampleRows, time.Since(start), time.Since(start)/time.Duration(sampleRows))
-	membuf, err := c.mayDropValueMemDB(txn)
-	if err != nil {
-		return 0, err
-	}
+	membuf := txn.GetMemBuffer()
+	diff := stage.Diff()
+	diff.CompareWithMemBuffer("update", membuf, n, sampleRows)
 	return (membuf.Size() / sampleRows) * n, nil
 }
 
@@ -243,6 +181,8 @@ func (c *Core) DeleteRows(n, sample int) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	runtime.GC()
+	stage := NewMemStage()
 	start := time.Now()
 	for i := 0; i < sampleRows; i++ {
 		before := befores[i]
@@ -256,10 +196,9 @@ func (c *Core) DeleteRows(n, sample int) (int, error) {
 		}
 	}
 	fmt.Printf("sample %d lines cost %s, %s per row\n", sampleRows, time.Since(start), time.Since(start)/time.Duration(sampleRows))
-	membuf, err := c.mayDropValueMemDB(txn)
-	if err != nil {
-		return 0, err
-	}
+	membuf := txn.GetMemBuffer()
+	diff := stage.Diff()
+	diff.CompareWithMemBuffer("delete", membuf, n, sampleRows)
 	return (membuf.Size() / sampleRows) * n, nil
 }
 
@@ -355,4 +294,63 @@ func growBytes(bytes []byte) {
 		}
 		bytes[i] = 0
 	}
+}
+
+type MemStage struct {
+	Stats      runtime.MemStats
+	ProcessMem uint64
+}
+
+func NewMemStage() MemStage {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return MemStage{
+		Stats:      m,
+		ProcessMem: GetMemByPid(),
+	}
+}
+
+type MemDiff struct {
+	Alloc   uint64
+	Sys     uint64
+	Process uint64
+}
+
+func (m *MemStage) Diff() MemDiff {
+	now := NewMemStage()
+	return MemDiff{
+		Alloc:   now.Stats.Alloc - m.Stats.Alloc,
+		Sys:     now.Stats.Sys - m.Stats.Sys,
+		Process: now.ProcessMem - m.ProcessMem,
+	}
+}
+
+func (m *MemDiff) SampleToTotal(n, sampleRows int) MemDiff {
+	return MemDiff{
+		Alloc:   m.Alloc * uint64(n) / uint64(sample),
+		Sys:     m.Sys * uint64(n) / uint64(sample),
+		Process: m.Process * uint64(n) / uint64(sample),
+	}
+}
+
+func (m *MemDiff) CompareWithMemBuffer(tp string, buffer kv.MemBuffer, n, sampleRows int) {
+	fmt.Printf("%s %d rows with %d rows sampled\n", tp, n, n/sampleRows)
+	bufferSize := buffer.Size()
+	fmt.Printf("sampled alloc: %s, sys: %s, process: %s, membuffer: %s\n", readableSize(int(m.Alloc)), readableSize(int(m.Sys)), readableSize(int(m.Process)), readableSize(bufferSize))
+	total := m.SampleToTotal(n, sampleRows)
+	totalBufferSize := bufferSize * n / sampleRows
+	fmt.Printf("total alloc: %s, sys: %s, process: %s, membuffer: %s\n", readableSize(int(total.Alloc)), readableSize(int(total.Sys)), readableSize(int(total.Process)), readableSize(totalBufferSize))
+}
+
+var units = []string{"B", "KB", "MB", "GB", "TB", "PB"}
+
+func readableSize(bytesCount int) string {
+	floatBytes := float64(bytesCount)
+	for _, unit := range units {
+		if floatBytes < 1024 {
+			return fmt.Sprintf("%.2f%s", floatBytes, unit)
+		}
+		floatBytes /= 1024
+	}
+	return fmt.Sprintf("%.2f%s", floatBytes, units[len(units)-1])
 }

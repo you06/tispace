@@ -173,6 +173,6 @@ require (
 replace github.com/go-ldap/ldap/v3 => github.com/YangKeao/ldap/v3 v3.4.5-0.20230421065457-369a3bab1117
 
 replace (
-	github.com/pingcap/tidb => github.com/you06/tidb v1.1.0-beta.0.20231130071716-eed83e2ef8ea
-	github.com/pingcap/tidb/pkg/parser => github.com/you06/tidb/pkg/parser v0.0.0-20231130071716-eed83e2ef8ea
+	github.com/pingcap/tidb => github.com/you06/tidb v1.1.0-beta.0.20231206032614-f8af1d543588
+	github.com/pingcap/tidb/pkg/parser => github.com/you06/tidb/pkg/parser v0.0.0-20231206032614-f8af1d543588
 )
