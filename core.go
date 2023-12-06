@@ -107,6 +107,7 @@ func (c *Core) InsertRows(n, sample int) (int, error) {
 	diff := stage.Diff()
 	diff.CompareWithMemBuffer("insert", membuf, n, sampleRows)
 	runtime.GC()
+	time.Sleep(time.Second)
 	diff = stage.Diff()
 	diff.CompareWithMemBuffer("insert-gc", membuf, n, sampleRows)
 	return (membuf.Size() / sampleRows) * n, nil
@@ -165,6 +166,12 @@ func (c *Core) UpdateRows(n, sample int) (int, error) {
 	membuf := txn.GetMemBuffer()
 	diff := stage.Diff()
 	diff.CompareWithMemBuffer("update", membuf, n, sampleRows)
+	runtime.GC()
+	time.Sleep(time.Second)
+	diff = stage.Diff()
+	diff.CompareWithMemBuffer("update-gc", membuf, n, sampleRows)
+	runtime.KeepAlive(handles)
+	runtime.KeepAlive(befores)
 	return (membuf.Size() / sampleRows) * n, nil
 }
 
@@ -199,6 +206,12 @@ func (c *Core) DeleteRows(n, sample int) (int, error) {
 	membuf := txn.GetMemBuffer()
 	diff := stage.Diff()
 	diff.CompareWithMemBuffer("delete", membuf, n, sampleRows)
+	runtime.GC()
+	time.Sleep(time.Second)
+	diff = stage.Diff()
+	diff.CompareWithMemBuffer("delete-gc", membuf, n, sampleRows)
+	runtime.KeepAlive(handles)
+	runtime.KeepAlive(befores)
 	return (membuf.Size() / sampleRows) * n, nil
 }
 
@@ -327,9 +340,9 @@ func (m *MemStage) Diff() MemDiff {
 
 func (m *MemDiff) SampleToTotal(n, sampleRows int) MemDiff {
 	return MemDiff{
-		Alloc:   m.Alloc * uint64(n) / uint64(sample),
-		Sys:     m.Sys * uint64(n) / uint64(sample),
-		Process: m.Process * uint64(n) / uint64(sample),
+		Alloc:   m.Alloc * uint64(n) / uint64(sampleRows),
+		Sys:     m.Sys * uint64(n) / uint64(sampleRows),
+		Process: m.Process * uint64(n) / uint64(sampleRows),
 	}
 }
 
